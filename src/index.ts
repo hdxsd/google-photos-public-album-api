@@ -59,66 +59,61 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 		
 		const text = await resp.text();
 
-		// Ambil title album
+		// Ambil judul album dari meta tag
 		const titleMatch = text.match(/<title>([^<]+) - Google Photos<\/title>/);
-		const albumTitle = titleMatch ? titleMatch[1].trim() : 'Untitled Album';
-
-		// Regex buat ambil semua gambar
-		const imageMatches = [
-			...text.matchAll(
-				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]+\][^\]]+\]\],(\d+),[^,]+,[^,]+,(\d+)/g,
-			),
-		];
+		let albumTitle = titleMatch ? titleMatch[1].trim() : 'Untitled Album';
 		
-		const images = imageMatches.flatMap(([, url, width, height, createdTimestamp, updatedTimestamp]) => {
+		// Fallback ke meta tag lain kalo ga ketemu
+		if (!titleMatch) {
+			const ogTitleMatch = text.match(/<meta property="og:title" content="([^"]+)"\/?>/);
+			albumTitle = ogTitleMatch ? ogTitleMatch[1].trim() : 'Untitled Album';
+		}
+
+		// Regex untuk ambil semua foto - improved version
+		const photoRegex = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_\-\.]+)",(\d+),(\d+)[^\]]+\](?:[^\[]*\[(?:[^\]]*)\])*?[^\]]*\]\],(\d+),(\d+),(\d+)/g;
+		
+		const matches = [...text.matchAll(photoRegex)];
+		
+		const images = matches.flatMap(([, url, width, height, timestamp1, timestamp2, timestamp3]) => {
 			if (!url || !width || !height) {
 				return [];
 			}
 
+			// Ambil timestamp yang valid (biasanya yang terakhir)
+			const timestamps = [timestamp1, timestamp2, timestamp3]
+				.filter(t => t && !isNaN(Number(t)))
+				.map(t => Number(t));
+			
+			const createdTimestamp = timestamps[0] || 0;
+			const updatedTimestamp = timestamps[timestamps.length - 1] || 0;
+
+			// Bersihin URL dari parameter tambahan
+			const cleanUrl = url.split('=')[0]; // Hapus =wxxx-hxxx
+
 			return {
-				url,
+				url: cleanUrl,
+				fullUrl: url, // URL asli dengan ukuran
 				width: Number(width),
 				height: Number(height),
-				createdTimestamp: Number(createdTimestamp),
-				updatedTimestamp: Number(updatedTimestamp),
+				createdTimestamp,
+				updatedTimestamp,
 			};
 		});
 
-		// Regex buat ambil semua album (kalo ini adalah collection/shared album)
-		// Format: ["/share/ABC123","Album Name",123, ...]
-		const albumMatches = [
-			...text.matchAll(
-				/\["(\/share\/[a-zA-Z0-9_-]+)","([^"]+)"(?:,[^,\]]+){2},(\d+)/g,
-			),
-		];
-
-		const albums = albumMatches.map(([, path, name, photoCount]) => ({
-			url: `https://photos.google.com${path}`,
-			name: name.trim(),
-			photoCount: Number(photoCount) || 0,
-		}));
-
-		// Deduplikasi gambar berdasarkan URL
-		const deduplicatedImages = [...new Map(images.map((image) => [image.url, image])).values()];
+		// Deduplikasi berdasarkan URL
+		const deduplicated = [...new Map(images.map((image) => [image.url, image])).values()];
 		
-		// Deduplikasi album berdasarkan URL
-		const deduplicatedAlbums = [...new Map(albums.map((album) => [album.url, album])).values()];
-
-		const response: any = { 
-			title: albumTitle,
-			images: deduplicatedImages, 
-			count: deduplicatedImages.length,
-			albumUrl: albumUrl
-		};
-
-		// Kalo ada album di dalamnya, tambahin ke response
-		if (deduplicatedAlbums.length > 0) {
-			response.albums = deduplicatedAlbums;
-			response.albumsCount = deduplicatedAlbums.length;
-		}
+		// Urutin berdasarkan createdTimestamp (yang paling baru di atas)
+		const sortedImages = deduplicated.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
 		
 		return jsonResponse(
-			response,
+			{ 
+				title: albumTitle,
+				images: sortedImages, 
+				count: sortedImages.length,
+				albumUrl: albumUrl,
+				fetchedAt: new Date().toISOString()
+			},
 			{
 				status: 200,
 				allowOrigin: env.ALLOW_ORIGIN,
