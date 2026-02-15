@@ -19,205 +19,188 @@ export default {
 };
 
 const handleGet = async (request: Request, env: Env): Promise<Response> => {
+	// Coba ambil dari query parameter dulu
+	const url = new URL(request.url);
+	let queryAlbumUrl = url.searchParams.get('url');
+	
+	// Kalo query parameter cuma ID doang (format: 7QzAnueaCVnrQdiG7)
+	if (queryAlbumUrl && !queryAlbumUrl.includes('http')) {
+		queryAlbumUrl = `https://photos.app.goo.gl/${queryAlbumUrl}`;
+	}
+	
+	// Fallback ke env variable kalo ga ada query parameter
+	const albumUrl = queryAlbumUrl?.trim() || env.ALBUM_URL?.trim();
+
+	if (!albumUrl) {
+		return jsonResponse(
+			{ 
+				error: 'ALBUM_URL not set. Provide ?url= parameter or set env variable',
+				title: null,
+				images: [],
+				count: 0,
+				albumUrl: null,
+				fetchedAt: new Date().toISOString()
+			}, 
+			{ status: 500, allowOrigin: env.ALLOW_ORIGIN }
+		);
+	}
+
 	try {
-		// Coba ambil dari query parameter dulu
-		const url = new URL(request.url);
-		let albumUrl = url.searchParams.get('url')?.trim();
-
-		// Kalo ga ada query parameter atau cuma ID pendek, coba format
-		if (albumUrl) {
-			// Kalo cuma ID pendek (contoh: 7QzAnueaCVnrQdiG7)
-			if (!albumUrl.startsWith('http')) {
-				albumUrl = `https://photos.app.goo.gl/${albumUrl}`;
-			}
-		} else {
-			// Fallback ke env variable
-			albumUrl = env.ALBUM_URL?.trim();
-		}
-
-		if (!albumUrl) {
-			return jsonResponse(
-				{
-					error: 'ALBUM_URL not set. Provide ?url= parameter or set env variable',
-					examples: {
-						env_var: 'GET https://your-worker.workers.dev/',
-						query_param: 'GET https://your-worker.workers.dev/?url=https://photos.app.goo.gl/7QzAnueaCVnrQdiG7',
-						short_id: 'GET https://your-worker.workers.dev/?url=7QzAnueaCVnrQdiG7'
-					}
-				},
-				{ status: 400, allowOrigin: env.ALLOW_ORIGIN }
-			);
-		}
-
-		// Follow redirect untuk short URL
-		const finalUrl = await resolveShortUrl(albumUrl);
-		
 		// Fetch album page
-		const resp = await fetch(`${finalUrl}?_imcp=1`, { 
+		const resp = await fetch(`${albumUrl}?_imcp=1`, { 
 			redirect: 'follow',
 			headers: {
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 			}
 		});
-		
 		const text = await resp.text();
 
-		// Ambil title dari meta og:title atau title tag
-		let title = 'Unknown Album';
-		const titleMatch = text.match(/<title>(.*?)<\/title>/);
+		// Extract album title from <title> tag
+		let title = null;
+		const titleMatch = text.match(/<title>(.+?)<\/title>/);
 		if (titleMatch) {
-			title = titleMatch[1].replace(/\s*-\s*Google\s*Photos\s*$/i, '').trim();
+			title = titleMatch[1].replace(' - Google Photos', '').trim();
 		}
 
-		// Regex untuk match gambar dan video
-		const mediaMatches = [
+		// Regex untuk foto dan video
+		const photoMatches = [
 			...text.matchAll(
-				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]+\][^\]]+\]\],(\d+),[^,]+,[^,]+,(\d+),(\d+),\[(\d+),(\d+)\]/g
+				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]+\][^\]]+\]\],(\d+),[^,]+,[^,]+,(\d+)/g
+			),
+		];
+		
+		const videoMatches = [
+			...text.matchAll(
+				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",.*?(?:video|mp4).*?\]/g
 			),
 		];
 
-		// Process each media item
-		const mediaItems = mediaMatches.map((match) => {
-			const [, baseUrl, width, height, createdTimestamp, updatedTimestamp, isVideo, videoWidth, videoHeight] = match;
-			
-			// Cek apakah ini video (biasanya isVideo = 1 untuk video)
-			if (isVideo === '1') {
-				// Ini video - generate multiple resolutions
-				const baseFile = baseUrl.replace(/=w\d+-h\d+(-[a-z]+)?$/, '');
+		// Process videos (prioritas utama kalo ada video)
+		if (videoMatches.length > 0) {
+			const videos = await Promise.all(videoMatches.map(async ([, baseUrl]) => {
+				if (!baseUrl) return null;
+				
+				// Generate thumbnail (frame pertama)
+				const thumbnail = `${baseUrl}=w1280-h720-no`;
+				
+				// Generate title dari URL atau default
+				const videoTitle = title || 'Untitled Video';
+				
+				// Cek resolusi asli dari URL (kalo ada info dimensi)
+				const resolutionMatch = text.match(new RegExp(baseUrl + '.*?(\\d+),(\\d+)'));
+				const width = resolutionMatch ? parseInt(resolutionMatch[1]) : 1920;
+				const height = resolutionMatch ? parseInt(resolutionMatch[2]) : 1080;
+				
+				// Tentukan resolusi berdasarkan tinggi
+				let resolutions = [];
+				if (height >= 1080) {
+					resolutions = ['m37', 'm22', 'm18']; // 1080p, 720p, 360p
+				} else if (height >= 720) {
+					resolutions = ['m22', 'm18']; // 720p, 360p
+				} else {
+					resolutions = ['m18']; // 360p doang
+				}
+				
+				// Buat sources
+				const sources = resolutions.map(res => ({
+					file: `${baseUrl}=${res}`,
+					label: res === 'm37' ? '1080p' : res === 'm22' ? '720p' : '360p',
+					type: 'video/mp4'
+				}));
 				
 				return {
-					title: title, // Bisa improved dengan extract judul per video kalo ada
+					title: videoTitle,
 					status: true,
-					sources: [
-						{
-							file: `${baseFile}=m37`,
-							label: '1080p',
-							type: 'video/mp4'
-						},
-						{
-							file: `${baseFile}=m22`,
-							label: '720p',
-							type: 'video/mp4'
-						},
-						{
-							file: `${baseFile}=m18`,
-							label: '360p',
-							type: 'video/mp4'
-						}
-					],
-					image: `${baseUrl}=w1280-h720-no`,
+					sources,
+					image: thumbnail,
 					host: 'googlephotos',
-					vtt: null,
-					width: Number(width),
-					height: Number(height),
-					createdTimestamp: Number(createdTimestamp),
-					updatedTimestamp: Number(updatedTimestamp)
+					vtt: null
 				};
-			} else {
-				// Ini gambar - generate multiple sizes
-				const baseFile = baseUrl.replace(/=w\d+-h\d+(-[a-z]+)?$/, '');
-				
-				return {
-					url: baseUrl,
-					width: Number(width),
-					height: Number(height),
-					createdTimestamp: Number(createdTimestamp),
-					updatedTimestamp: Number(updatedTimestamp),
-					sources: [
-						{
-							url: `${baseFile}=w1080-h1080-no`,
-							label: '1080p',
-							width: 1080,
-							height: Math.round((Number(height) / Number(width)) * 1080)
-						},
-						{
-							url: `${baseFile}=w720-h720-no`,
-							label: '720p',
-							width: 720,
-							height: Math.round((Number(height) / Number(width)) * 720)
-						},
-						{
-							url: `${baseFile}=w360-h360-no`,
-							label: '360p',
-							width: 360,
-							height: Math.round((Number(height) / Number(width)) * 360)
-						}
-					]
-				};
+			}));
+			
+			// Filter out null values
+			const validVideos = videos.filter(v => v !== null);
+			
+			return jsonResponse(
+				{ 
+					title,
+					images: validVideos,
+					count: validVideos.length,
+					albumUrl,
+					fetchedAt: new Date().toISOString()
+				},
+				{
+					status: 200,
+					allowOrigin: env.ALLOW_ORIGIN,
+					extraHeaders: { 
+						'Cache-Control': env.CACHE_CONTROL || 'max-age=604800, stale-while-revalidate'
+					},
+				}
+			);
+		}
+
+		// Kalo ga ada video, proses foto biasa
+		const images = photoMatches.flatMap(([, url, width, height, createdTimestamp, updatedTimestamp]) => {
+			if (!url || !width || !height) {
+				return [];
 			}
+
+			return {
+				url,
+				width: Number(width),
+				height: Number(height),
+				createdTimestamp: Number(createdTimestamp),
+				updatedTimestamp: Number(updatedTimestamp),
+			};
 		});
 
-		// Deduplikasi berdasarkan URL
-		const uniqueMedia = [...new Map(mediaItems.map((item) => {
-			const key = item.sources ? item.sources[0]?.url || item.url : item.image;
-			return [key, item];
-		})).values()];
-
-		// Hitung statistik
-		const videos = uniqueMedia.filter(item => item.sources && !item.url);
-		const images = uniqueMedia.filter(item => item.url);
-
-		const response = {
-			title: title,
-			media: uniqueMedia,
-			statistics: {
-				total: uniqueMedia.length,
-				videos: videos.length,
-				images: images.length
-			},
-			albumUrl: finalUrl,
-			originalUrl: albumUrl,
-			fetchedAt: new Date().toISOString()
-		};
-
+		const deduplicated = [...new Map(images.map((image) => [image.url, image])).values()];
+		
+		// Format foto sesuai output yang diminta (tapi tetep pake struktur yg sama)
+		const formattedImages = deduplicated.map(img => ({
+			title: title || 'Untitled Photo',
+			status: true,
+			sources: [
+				{
+					file: img.url,
+					label: `${img.height}p`,
+					type: 'image/jpeg'
+				}
+			],
+			image: img.url,
+			host: 'googlephotos',
+			vtt: null
+		}));
+		
 		return jsonResponse(
-			response,
+			{ 
+				title,
+				images: formattedImages,
+				count: formattedImages.length,
+				albumUrl,
+				fetchedAt: new Date().toISOString()
+			},
 			{
 				status: 200,
 				allowOrigin: env.ALLOW_ORIGIN,
 				extraHeaders: { 
-					'Cache-Control': env.CACHE_CONTROL || 'max-age=604800, stale-while-revalidate',
-					'X-Total-Count': uniqueMedia.length.toString()
-				}
+					'Cache-Control': env.CACHE_CONTROL || 'max-age=604800, stale-while-revalidate'
+				},
 			}
 		);
 
-	} catch (error: any) {
+	} catch (error) {
 		return jsonResponse(
 			{ 
-				error: 'Failed to fetch album', 
-				message: error.message,
-				stack: error.stack 
-			},
+				error: error.message,
+				title: null,
+				images: [],
+				count: 0,
+				albumUrl,
+				fetchedAt: new Date().toISOString()
+			}, 
 			{ status: 500, allowOrigin: env.ALLOW_ORIGIN }
 		);
-	}
-};
-
-// Fungsi untuk resolve short URL
-const resolveShortUrl = async (url: string): Promise<string> => {
-	try {
-		// Kalo udah long URL, return as is
-		if (url.includes('photos.google.com')) {
-			return url;
-		}
-
-		// Follow redirect untuk short URL
-		const resp = await fetch(url, { 
-			method: 'HEAD',
-			redirect: 'manual'
-		});
-
-		if (resp.status >= 300 && resp.status < 400) {
-			const location = resp.headers.get('location');
-			if (location) {
-				return location;
-			}
-		}
-		
-		return url;
-	} catch {
-		return url;
 	}
 };
 
