@@ -59,26 +59,36 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 		
 		const text = await resp.text();
 
-		const matches = [
+		// Regex untuk ambil data gambar/video
+		const imageMatches = [
 			...text.matchAll(
 				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]+\][^\]]+\]\],(\d+),[^,]+,[^,]+,(\d+)/g,
 			),
 		];
 		
-		const images = matches.flatMap(([, url, width, height, createdTimestamp, updatedTimestamp]) => {
-			if (!url || !width || !height) {
-				return [];
-			}
+		// Regex untuk ambil nama file dari div
+		const filenameMatches = [
+			...text.matchAll(
+				/<div class="R9U8ab" aria-label="Nama file: ([^"]+)">([^<]+)<\/div>/g,
+			),
+		];
 
+		// Gabungkan data gambar dengan nama file
+		const images = imageMatches.map(([, url, width, height, createdTimestamp, updatedTimestamp], index) => {
+			// Cari nama file yang sesuai (kalau ada)
+			const filename = filenameMatches[index] ? filenameMatches[index][1] || filenameMatches[index][2] : null;
+			
 			return {
 				url,
 				width: Number(width),
 				height: Number(height),
 				createdTimestamp: Number(createdTimestamp),
 				updatedTimestamp: Number(updatedTimestamp),
+				filename: filename, // Tambahin filename
 			};
-		});
+		}).filter(img => img.url); // Filter yang valid
 
+		// Deduplikasi berdasarkan URL
 		const deduplicated = [...new Map(images.map((image) => [image.url, image])).values()];
 		
 		return jsonResponse(
