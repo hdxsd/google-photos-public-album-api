@@ -46,7 +46,7 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 		const resp = await fetch(`${albumUrl}?_imcp=1`, { 
 			redirect: 'follow',
 			headers: {
-				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+				'User-Agent': 'Mozilla/5.0 (compatible; Google-Photos-Worker/1.0)'
 			}
 		});
 		
@@ -59,87 +59,66 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 		
 		const text = await resp.text();
 
-		// Regex untuk ambil data gambar/video
+		// Ambil title album
+		const titleMatch = text.match(/<title>([^<]+) - Google Photos<\/title>/);
+		const albumTitle = titleMatch ? titleMatch[1].trim() : 'Untitled Album';
+
+		// Regex buat ambil semua gambar
 		const imageMatches = [
 			...text.matchAll(
 				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]+\][^\]]+\]\],(\d+),[^,]+,[^,]+,(\d+)/g,
 			),
 		];
 		
-		// Regex yang lebih fleksibel untuk ambil nama file
-		// Coba berbagai pattern yang mungkin muncul
-		const filenamePatterns = [
-			// Pattern dari contoh: <div class="R9U8ab" aria-label="Nama file: JoatPno 03.mp4">JoatPno 03.mp4</div>
-			/<div class="R9U8ab"[^>]*aria-label="Nama file:\s*([^"]+)"[^>]*>([^<]+)<\/div>/g,
-			
-			// Pattern tanpa aria-label
-			/<div class="R9U8ab"[^>]*>([^<]+)<\/div>/g,
-			
-			// Pattern dengan atribut lain
-			/<div[^>]*class="[^"]*R9U8ab[^"]*"[^>]*>([^<]+)<\/div>/g,
-			
-			// Pattern dari data atribut
-			/<div[^>]*data-original-filename="([^"]+)"[^>]*>/g,
-			
-			// Pattern generic buat file name di div
-			/<div[^>]*>(?:[^<]*?)([^<>]+\.(?:jpg|jpeg|png|gif|mp4|mov|avi|heic))[^<]*<\/div>/gi
-		];
-
-		// Kumpulin semua filename yang ketemu
-		let allFilenames: string[] = [];
-		for (const pattern of filenamePatterns) {
-			const matches = [...text.matchAll(pattern)];
-			if (matches.length > 0) {
-				// Ambil dari capture group yang ada isinya
-				allFilenames = matches.map(m => {
-					// Cari capture group yang bukan undefined dan bukan tag HTML
-					for (let i = 1; i < m.length; i++) {
-						if (m[i] && !m[i].includes('<') && !m[i].includes('>')) {
-							return m[i].trim();
-						}
-					}
-					return null;
-				}).filter(Boolean) as string[];
-				
-				if (allFilenames.length > 0) break;
+		const images = imageMatches.flatMap(([, url, width, height, createdTimestamp, updatedTimestamp]) => {
+			if (!url || !width || !height) {
+				return [];
 			}
-		}
 
-		// Gabungkan data gambar dengan nama file
-		const images = imageMatches.map(([, url, width, height, createdTimestamp, updatedTimestamp], index) => {
-			// Cari nama file yang sesuai (kalau ada)
-			const filename = allFilenames[index] || null;
-			
-			// Log buat debugging (bisa dihapus nanti)
-			console.log(`Image ${index}:`, { url, filename });
-			
 			return {
 				url,
 				width: Number(width),
 				height: Number(height),
 				createdTimestamp: Number(createdTimestamp),
 				updatedTimestamp: Number(updatedTimestamp),
-				filename: filename,
 			};
-		}).filter(img => img.url);
+		});
 
-		// Deduplikasi berdasarkan URL
-		const deduplicated = [...new Map(images.map((image) => [image.url, image])).values()];
+		// Regex buat ambil semua album (kalo ini adalah collection/shared album)
+		// Format: ["/share/ABC123","Album Name",123, ...]
+		const albumMatches = [
+			...text.matchAll(
+				/\["(\/share\/[a-zA-Z0-9_-]+)","([^"]+)"(?:,[^,\]]+){2},(\d+)/g,
+			),
+		];
+
+		const albums = albumMatches.map(([, path, name, photoCount]) => ({
+			url: `https://photos.google.com${path}`,
+			name: name.trim(),
+			photoCount: Number(photoCount) || 0,
+		}));
+
+		// Deduplikasi gambar berdasarkan URL
+		const deduplicatedImages = [...new Map(images.map((image) => [image.url, image])).values()];
 		
-		// Debug: cek apakah filenamePatterns ada yang match
-		const debug = {
-			totalMatches: imageMatches.length,
-			filenamesFound: allFilenames.length,
-			firstFewChars: text.substring(0, 500) // Buat liat struktur HTML
+		// Deduplikasi album berdasarkan URL
+		const deduplicatedAlbums = [...new Map(albums.map((album) => [album.url, album])).values()];
+
+		const response: any = { 
+			title: albumTitle,
+			images: deduplicatedImages, 
+			count: deduplicatedImages.length,
+			albumUrl: albumUrl
 		};
+
+		// Kalo ada album di dalamnya, tambahin ke response
+		if (deduplicatedAlbums.length > 0) {
+			response.albums = deduplicatedAlbums;
+			response.albumsCount = deduplicatedAlbums.length;
+		}
 		
 		return jsonResponse(
-			{ 
-				images: deduplicated, 
-				count: deduplicated.length,
-				albumUrl: albumUrl,
-				debug: debug // Sementara buat debug, nanti bisa dihapus
-			},
+			response,
 			{
 				status: 200,
 				allowOrigin: env.ALLOW_ORIGIN,
