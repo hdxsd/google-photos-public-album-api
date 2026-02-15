@@ -19,182 +19,135 @@ export default {
 };
 
 const handleGet = async (request: Request, env: Env): Promise<Response> => {
-	// Coba ambil dari query parameter dulu
-	const url = new URL(request.url);
-	let queryAlbumUrl = url.searchParams.get('url');
-	
-	// Kalo query parameter cuma ID doang (format: 7QzAnueaCVnrQdiG7)
-	if (queryAlbumUrl && !queryAlbumUrl.includes('http')) {
-		queryAlbumUrl = `https://photos.app.goo.gl/${queryAlbumUrl}`;
-	}
-	
-	// Fallback ke env variable kalo ga ada query parameter
-	const albumUrl = queryAlbumUrl?.trim() || env.ALBUM_URL?.trim();
-
-	if (!albumUrl) {
-		return jsonResponse(
-			{ 
-				error: 'ALBUM_URL not set. Provide ?url= parameter or set env variable',
-				title: null,
-				images: [],
-				count: 0,
-				albumUrl: null,
-				fetchedAt: new Date().toISOString()
-			}, 
-			{ status: 500, allowOrigin: env.ALLOW_ORIGIN }
-		);
-	}
-
 	try {
-		// Fetch album page
+		// Ambil album URL dari query parameter atau env
+		const url = new URL(request.url);
+		let albumUrl = url.searchParams.get('url')?.trim() || env.ALBUM_URL?.trim();
+		
+		// Handle short URL format (kalo cuma ID doang)
+		if (albumUrl && !albumUrl.startsWith('http')) {
+			albumUrl = `https://photos.app.goo.gl/${albumUrl}`;
+		}
+
+		if (!albumUrl) {
+			return jsonResponse(
+				{ error: 'ALBUM_URL not set. Provide ?url= parameter or set env variable' }, 
+				{ status: 500, allowOrigin: env.ALLOW_ORIGIN }
+			);
+		}
+
+		// Fetch album dengan follow redirect
 		const resp = await fetch(`${albumUrl}?_imcp=1`, { 
 			redirect: 'follow',
-			headers: {
-				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-			}
+			headers: { 'User-Agent': 'Mozilla/5.0' }
 		});
+		
 		const text = await resp.text();
 
-		// Extract album title from <title> tag
-		let title = null;
+		// Ambil title album dari <title> tag
 		const titleMatch = text.match(/<title>(.+?)<\/title>/);
-		if (titleMatch) {
-			title = titleMatch[1].replace(' - Google Photos', '').trim();
-		}
+		let title = titleMatch ? titleMatch[1].replace(/\s*-\s*Google\s*Photos\s*$/i, '').trim() : 'Untitled Album';
 
-		// Regex buat nangkep semua video - improved version
-		// Format: ["https://lh3.googleusercontent.com/pw/...", width, height, ...]
-		const videoRegex = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]*\].*?(?:video|mp4).*?\]/gi;
-		
-		// Alternative: cari semua URL yang match pattern Google Photos
-		const urlRegex = /(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)/g;
-		
-		// Cari semua matches pake regex pertama
-		const matches = [...text.matchAll(videoRegex)];
-		
-		// Kalo pake regex pertama gagal, coba metode kedua
-		let videoUrls = [];
-		if (matches.length === 0) {
-			// Ambil semua URL dulu
-			const allUrls = [...new Set(text.match(urlRegex) || [])];
-			
-			// Filter yang kemungkinan video (biasanya ada parameter video di sekitarnya)
-			videoUrls = allUrls.filter(url => {
-				const context = text.substring(Math.max(0, text.indexOf(url) - 200), Math.min(text.length, text.indexOf(url) + 200));
-				return context.includes('video') || context.includes('mp4') || context.includes('mime');
-			});
-		}
+		// Regex untuk ambil video dari Google Photos
+		const videoMatches = [
+			...text.matchAll(
+				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[^"]+)",(\d+),(\d+)[^\]]+\](?:[^\[]*\[[^\]]*\]){2,}\]\],(\d+),(\d+),(\d+),(\d+),(\d+)/g
+			),
+		];
 
-		// Process videos
-		const videos = new Map(); // Pake Map buat deduplikasi
-		
-		// Dari regex matches
-		for (const match of matches) {
-			const baseUrl = match[1];
-			if (!baseUrl || videos.has(baseUrl)) continue;
-			
-			const width = match[2] ? parseInt(match[2]) : 1920;
-			const height = match[3] ? parseInt(match[3]) : 1080;
-			
-			videos.set(baseUrl, { baseUrl, width, height });
-		}
-		
-		// Dari URL list
-		for (const url of videoUrls) {
-			if (videos.has(url)) continue;
-			
-			// Coba cari dimensi di sekitar URL
-			const context = text.substring(Math.max(0, text.indexOf(url) - 100), Math.min(text.length, text.indexOf(url) + 100));
-			const dimMatch = context.match(/,(\d+),(\d+)/);
-			
-			videos.set(url, { 
-				baseUrl: url, 
-				width: dimMatch ? parseInt(dimMatch[1]) : 1920,
-				height: dimMatch ? parseInt(dimMatch[2]) : 1080
-			});
-		}
+		// Regex untuk ambil thumbnail
+		const thumbnailMatches = [
+			...text.matchAll(
+				/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[^"]+)",(\d+),(\d+)\]/g
+			),
+		];
 
-		// Kalo masih kosong, coba pake regex foto sebagai fallback
-		if (videos.size === 0) {
-			const photoRegex = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]+\][^\]]+\]\],(\d+),[^,]+,[^,]+,(\d+)/g;
-			const photoMatches = [...text.matchAll(photoRegex)];
-			
-			for (const match of photoMatches) {
-				const baseUrl = match[1];
-				if (!baseUrl || videos.has(baseUrl)) continue;
-				
-				videos.set(baseUrl, {
-					baseUrl,
-					width: parseInt(match[2]),
-					height: parseInt(match[3])
-				});
+		// Map untuk thumbnail
+		const thumbnailMap = new Map();
+		thumbnailMatches.forEach(([, thumbUrl, width, height]) => {
+			if (thumbUrl && !thumbnailMap.has(thumbUrl)) {
+				thumbnailMap.set(thumbUrl, { width: Number(width), height: Number(height) });
 			}
-		}
+		});
 
-		console.log(`Found ${videos.size} videos`); // Debug log
+		// Proses video
+		const videos = [];
+		const seenUrls = new Set();
 
-		// Convert ke array dan buat output
-		const videoList = await Promise.all([...videos.values()].map(async (video) => {
-			// Generate thumbnail
-			const thumbnail = `${video.baseUrl}=w1280-h720-no`;
+		for (const match of videoMatches) {
+			const [, baseUrl, width, height, ...timestamps] = match;
 			
-			// Tentukan resolusi berdasarkan tinggi
-			const resolutions = [];
-			if (video.height >= 1080) {
-				resolutions.push('m37'); // 1080p
-				resolutions.push('m22'); // 720p
-				resolutions.push('m18'); // 360p
-			} else if (video.height >= 720) {
-				resolutions.push('m22'); // 720p
-				resolutions.push('m18'); // 360p
-			} else {
-				resolutions.push('m18'); // 360p
+			if (!baseUrl || seenUrls.has(baseUrl)) continue;
+			
+			// Ambil timestamp terakhir sebagai updated
+			const validTimestamps = timestamps.filter(t => t && !isNaN(Number(t))).map(Number);
+			const updatedTimestamp = validTimestamps.length > 0 ? Math.max(...validTimestamps) : Date.now();
+			
+			// Cari thumbnail yang cocok
+			let thumbnail = null;
+			let thumbDimensions = { width: 1280, height: 720 }; // default
+			
+			for (const [thumbUrl, dims] of thumbnailMap) {
+				if (thumbUrl.includes(baseUrl.split('/pw/')[1]?.split('=')[0])) {
+					thumbnail = thumbUrl;
+					thumbDimensions = dims;
+					break;
+				}
 			}
 			
-			// Buat sources
+			if (!thumbnail) {
+				// Fallback: generate thumbnail dari base URL
+				thumbnail = `${baseUrl}=w${thumbDimensions.width}-h${thumbDimensions.height}-no`;
+			}
+
+			// Resolusi yang tersedia
+			const resolutions = [
+				{ label: '1080p', suffix: 'm37', width: 1920, height: 1080 },
+				{ label: '720p', suffix: 'm22', width: 1280, height: 720 },
+				{ label: '360p', suffix: 'm18', width: 640, height: 360 }
+			];
+
 			const sources = resolutions.map(res => ({
-				file: `${video.baseUrl}=${res}`,
-				label: res === 'm37' ? '1080p' : res === 'm22' ? '720p' : '360p',
+				file: `${baseUrl}=${res.suffix}`,
+				label: res.label,
 				type: 'video/mp4'
 			}));
-			
-			return {
-				title: title || 'Untitled Video',
+
+			videos.push({
+				title: title,
 				status: true,
-				sources,
-				image: thumbnail,
+				sources: sources,
+				image: `${thumbnail}=w${thumbDimensions.width}-h${thumbDimensions.height}-no`,
 				host: 'googlephotos',
 				vtt: null
-			};
-		}));
-		
+			});
+
+			seenUrls.add(baseUrl);
+		}
+
+		const result = {
+			title: title,
+			images: [], // kosong karena kita fokus ke video
+			count: videos.length,
+			albumUrl: albumUrl,
+			fetchedAt: new Date().toISOString(),
+			videos: videos // tambahin array videos
+		};
+
 		return jsonResponse(
-			{ 
-				title,
-				images: videoList,
-				count: videoList.length,
-				albumUrl,
-				fetchedAt: new Date().toISOString()
-			},
+			result,
 			{
 				status: 200,
 				allowOrigin: env.ALLOW_ORIGIN,
 				extraHeaders: { 
-					'Cache-Control': env.CACHE_CONTROL || 'max-age=604800, stale-while-revalidate'
+					'Cache-Control': env.CACHE_CONTROL || 'max-age=3600, stale-while-revalidate'
 				},
 			}
 		);
 
 	} catch (error) {
 		return jsonResponse(
-			{ 
-				error: error.message,
-				title: null,
-				images: [],
-				count: 0,
-				albumUrl,
-				fetchedAt: new Date().toISOString()
-			}, 
+			{ error: 'Failed to fetch album', details: error.message },
 			{ status: 500, allowOrigin: env.ALLOW_ORIGIN }
 		);
 	}
