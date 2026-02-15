@@ -19,18 +19,14 @@ export default {
 };
 
 const handleGet = async (request: Request, env: Env): Promise<Response> => {
-	// Coba ambil dari query parameter dulu
 	const url = new URL(request.url);
 	let albumUrl = url.searchParams.get('url')?.trim();
 	
-	// Kalo ga ada parameter url, pake env variable
 	if (!albumUrl) {
 		albumUrl = env.ALBUM_URL?.trim();
 	}
 	
-	// Handle kalo user masukin short code aja (7QzAnueaCVnrQdiG7)
 	if (albumUrl && !albumUrl.startsWith('http')) {
-		// Asumsinya ini short code dari photos.app.goo.gl
 		albumUrl = `https://photos.app.goo.gl/${albumUrl}`;
 	}
 
@@ -42,11 +38,15 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 	}
 
 	try {
-		// Fetch dengan follow redirect (short link bakal di-redirect ke URL panjang)
-		const resp = await fetch(`${albumUrl}?_imcp=1`, { 
+		// Fetch dengan parameter yang tepat
+		const resp = await fetch(albumUrl, { 
 			redirect: 'follow',
 			headers: {
-				'User-Agent': 'Mozilla/5.0 (compatible; Google-Photos-Worker/1.0)'
+				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+				'Accept-Language': 'en-US,en;q=0.5',
+				'Cache-Control': 'no-cache',
+				'Pragma': 'no-cache'
 			}
 		});
 		
@@ -57,88 +57,113 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 			);
 		}
 		
-		const text = await resp.text();
+		const html = await resp.text();
 
-		// Ambil judul album dari <title>
-		const titleMatch = text.match(/<title>(.+?) - Google Photos<\/title>/);
-		const albumTitle = titleMatch ? titleMatch[1].trim() : 'Untitled Album';
+		// Ambil title (bersihin dari " - Google Photos")
+		let title = 'Untitled Album';
+		const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+		if (titleMatch) {
+			title = titleMatch[1].replace(/\s*-\s*Google\s*Photos\s*$/i, '').trim();
+		}
 
-		// Regex buat ambil semua foto - improved version
-		const imageRegex = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_\-]+)",(\d+),(\d+)[^\]]+\](?:[^\[]*\[[^\]]*\])*?[^\]]+\]\],(\d+),(\d+),(\d+)/g;
-		
-		const matches = [...text.matchAll(imageRegex)];
-		
-		console.log(`Found ${matches.length} raw matches`); // Debug log
+		// CARA 1: Coba regex yang lebih fleksibel untuk data gambar
+		const imageMatches = [
+			// Format 1: array pattern dengan https://lh3.googleusercontent.com
+			...html.matchAll(/\["(https:\/\/lh3\.googleusercontent\.com\/[^"]+?)",(\d+),(\d+)/g),
+			
+			// Format 2: pattern dengan proxy URL
+			...html.matchAll(/"https:\/\/lh3\.googleusercontent\.com\/[^"]+?=w(\d+)-h(\d+)/g),
+			
+			// Format 3: cari semua URL gambar
+			...html.matchAll(/(https:\/\/lh3\.googleusercontent\.com\/[^\s"']+?)(?=["'\s])/g)
+		];
 
-		const images = matches.flatMap((match) => {
-			try {
-				const [, url, width, height, createdTimestamp, updatedTimestamp, uploadTimestamp] = match;
-				
-				if (!url || !width || !height) {
-					return [];
+		// CARA 2: Coba cari di JSON data
+		let jsonData = null;
+		const jsonMatch = html.match(/AF_initDataCallback\s*\(\s*({.+?})\s*\)\s*;/g);
+		if (jsonMatch) {
+			for (const match of jsonMatch) {
+				try {
+					const jsonStr = match.replace(/^AF_initDataCallback\s*\(\s*/, '').replace(/\s*\);?\s*$/, '');
+					const data = JSON.parse(jsonStr);
+					if (data && typeof data === 'object') {
+						jsonData = data;
+						break;
+					}
+				} catch (e) {
+					// Skip kalo gagal parse
 				}
-
-				// Konversi ke number dan validasi
-				const widthNum = Number(width);
-				const heightNum = Number(height);
-				const createdNum = Number(createdTimestamp);
-				const updatedNum = Number(updatedTimestamp);
-				const uploadedNum = Number(uploadTimestamp);
-
-				// Pilih timestamp yang valid (prioritas: created > uploaded > updated)
-				let timestamp = createdNum > 0 ? createdNum : (uploadedNum > 0 ? uploadedNum : updatedNum);
-				
-				// Kalo semua 0, pake current time
-				if (timestamp <= 0) {
-					timestamp = Date.now() / 1000;
-				}
-
-				return {
-					url: url.split('=')[0], // Bersihin URL dari parameter tambahan
-					width: widthNum,
-					height: heightNum,
-					timestamp: timestamp,
-					createdTimestamp: createdNum || timestamp,
-					updatedTimestamp: updatedNum || timestamp,
-					uploadedTimestamp: uploadedNum || timestamp,
-				};
-			} catch (e) {
-				console.error('Error parsing match:', e);
-				return [];
 			}
-		});
+		}
 
-		// Deduplikasi berdasarkan URL
-		const uniqueImages = new Map();
-		images.forEach(img => {
-			const key = img.url.split('=')[0]; // Key based on base URL
-			if (!uniqueImages.has(key) || uniqueImages.get(key).timestamp < img.timestamp) {
-				uniqueImages.set(key, img);
-			}
-		});
-
-		const deduplicated = Array.from(uniqueImages.values());
+		// Proses gambar dari berbagai sumber
+		const images = new Map();
 		
-		// Sort by timestamp (newest first)
-		deduplicated.sort((a, b) => b.timestamp - a.timestamp);
+		// Dari regex matches
+		for (const match of imageMatches) {
+			let url = match[1] || match[0];
+			// Bersihin URL dari parameter tambahan
+			url = url.split('=')[0].split('?')[0];
+			
+			if (url && url.includes('lh3.googleusercontent.com') && !images.has(url)) {
+				images.set(url, {
+					url,
+					width: parseInt(match[2]) || 0,
+					height: parseInt(match[3]) || 0,
+				});
+			}
+		}
 
+		// Kalo masih kosong, coba fetch dengan parameter _imcp=1 (seperti sebelumnya)
+		if (images.size === 0) {
+			const imcpResp = await fetch(`${albumUrl}?_imcp=1`, {
+				headers: { 'User-Agent': 'Mozilla/5.0' }
+			});
+			const imcpText = await imcpResp.text();
+			
+			const imcpMatches = [
+				...imcpText.matchAll(
+					/\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_-]+)",(\d+),(\d+)[^\]]+\][^\]]+\]\],(\d+),[^,]+,[^,]+,(\d+)/g,
+				),
+			];
+			
+			for (const match of imcpMatches) {
+				if (match[1]) {
+					images.set(match[1], {
+						url: match[1],
+						width: Number(match[2]) || 0,
+						height: Number(match[3]) || 0,
+						createdTimestamp: Number(match[4]) || 0,
+						updatedTimestamp: Number(match[5]) || 0,
+					});
+				}
+			}
+		}
+
+		// Konversi Map ke Array
+		const imagesArray = Array.from(images.values());
+		
+		// Log untuk debugging (akan muncul di console Cloudflare)
+		console.log(`Found ${imagesArray.length} images for album: ${title}`);
+		
 		return jsonResponse(
 			{ 
-				title: albumTitle,
-				images: deduplicated, 
-				count: deduplicated.length,
-				albumUrl: albumUrl,
+				title,
+				images: imagesArray, 
+				count: imagesArray.length,
+				albumUrl,
 				fetchedAt: new Date().toISOString()
 			},
 			{
 				status: 200,
 				allowOrigin: env.ALLOW_ORIGIN,
 				extraHeaders: { 
-					'Cache-Control': env.CACHE_CONTROL || 'max-age=604800, stale-while-revalidate' 
+					'Cache-Control': env.CACHE_CONTROL || 'max-age=3600, stale-while-revalidate=86400' 
 				},
 			}
 		);
 	} catch (error: any) {
+		console.error('Error:', error);
 		return jsonResponse(
 			{ error: `Failed to process album: ${error.message}` }, 
 			{ status: 500, allowOrigin: env.ALLOW_ORIGIN }
@@ -147,7 +172,7 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 };
 
 const jsonResponse = (data: any, params: { status?: number; allowOrigin?: string; extraHeaders?: Record<string, string> }) => {
-	return new Response(JSON.stringify(data, null, 2), { // Added pretty print
+	return new Response(JSON.stringify(data), {
 		status: params.status || 200,
 		headers: { 
 			'content-type': 'application/json', 
