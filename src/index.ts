@@ -59,58 +59,74 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 		
 		const text = await resp.text();
 
-		// Ambil judul album dari meta tag
-		const titleMatch = text.match(/<title>([^<]+) - Google Photos<\/title>/);
-		let albumTitle = titleMatch ? titleMatch[1].trim() : 'Untitled Album';
-		
-		// Fallback ke meta tag lain kalo ga ketemu
-		if (!titleMatch) {
-			const ogTitleMatch = text.match(/<meta property="og:title" content="([^"]+)"\/?>/);
-			albumTitle = ogTitleMatch ? ogTitleMatch[1].trim() : 'Untitled Album';
-		}
+		// Ambil judul album dari <title>
+		const titleMatch = text.match(/<title>(.+?) - Google Photos<\/title>/);
+		const albumTitle = titleMatch ? titleMatch[1].trim() : 'Untitled Album';
 
-		// Regex untuk ambil semua foto - improved version
-		const photoRegex = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_\-\.]+)",(\d+),(\d+)[^\]]+\](?:[^\[]*\[(?:[^\]]*)\])*?[^\]]*\]\],(\d+),(\d+),(\d+)/g;
+		// Regex buat ambil semua foto - improved version
+		const imageRegex = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\/a-zA-Z0-9_\-]+)",(\d+),(\d+)[^\]]+\](?:[^\[]*\[[^\]]*\])*?[^\]]+\]\],(\d+),(\d+),(\d+)/g;
 		
-		const matches = [...text.matchAll(photoRegex)];
+		const matches = [...text.matchAll(imageRegex)];
 		
-		const images = matches.flatMap(([, url, width, height, timestamp1, timestamp2, timestamp3]) => {
-			if (!url || !width || !height) {
+		console.log(`Found ${matches.length} raw matches`); // Debug log
+
+		const images = matches.flatMap((match) => {
+			try {
+				const [, url, width, height, createdTimestamp, updatedTimestamp, uploadTimestamp] = match;
+				
+				if (!url || !width || !height) {
+					return [];
+				}
+
+				// Konversi ke number dan validasi
+				const widthNum = Number(width);
+				const heightNum = Number(height);
+				const createdNum = Number(createdTimestamp);
+				const updatedNum = Number(updatedTimestamp);
+				const uploadedNum = Number(uploadTimestamp);
+
+				// Pilih timestamp yang valid (prioritas: created > uploaded > updated)
+				let timestamp = createdNum > 0 ? createdNum : (uploadedNum > 0 ? uploadedNum : updatedNum);
+				
+				// Kalo semua 0, pake current time
+				if (timestamp <= 0) {
+					timestamp = Date.now() / 1000;
+				}
+
+				return {
+					url: url.split('=')[0], // Bersihin URL dari parameter tambahan
+					width: widthNum,
+					height: heightNum,
+					timestamp: timestamp,
+					createdTimestamp: createdNum || timestamp,
+					updatedTimestamp: updatedNum || timestamp,
+					uploadedTimestamp: uploadedNum || timestamp,
+				};
+			} catch (e) {
+				console.error('Error parsing match:', e);
 				return [];
 			}
-
-			// Ambil timestamp yang valid (biasanya yang terakhir)
-			const timestamps = [timestamp1, timestamp2, timestamp3]
-				.filter(t => t && !isNaN(Number(t)))
-				.map(t => Number(t));
-			
-			const createdTimestamp = timestamps[0] || 0;
-			const updatedTimestamp = timestamps[timestamps.length - 1] || 0;
-
-			// Bersihin URL dari parameter tambahan
-			const cleanUrl = url.split('=')[0]; // Hapus =wxxx-hxxx
-
-			return {
-				url: cleanUrl,
-				fullUrl: url, // URL asli dengan ukuran
-				width: Number(width),
-				height: Number(height),
-				createdTimestamp,
-				updatedTimestamp,
-			};
 		});
 
 		// Deduplikasi berdasarkan URL
-		const deduplicated = [...new Map(images.map((image) => [image.url, image])).values()];
+		const uniqueImages = new Map();
+		images.forEach(img => {
+			const key = img.url.split('=')[0]; // Key based on base URL
+			if (!uniqueImages.has(key) || uniqueImages.get(key).timestamp < img.timestamp) {
+				uniqueImages.set(key, img);
+			}
+		});
+
+		const deduplicated = Array.from(uniqueImages.values());
 		
-		// Urutin berdasarkan createdTimestamp (yang paling baru di atas)
-		const sortedImages = deduplicated.sort((a, b) => b.createdTimestamp - a.createdTimestamp);
-		
+		// Sort by timestamp (newest first)
+		deduplicated.sort((a, b) => b.timestamp - a.timestamp);
+
 		return jsonResponse(
 			{ 
 				title: albumTitle,
-				images: sortedImages, 
-				count: sortedImages.length,
+				images: deduplicated, 
+				count: deduplicated.length,
 				albumUrl: albumUrl,
 				fetchedAt: new Date().toISOString()
 			},
@@ -131,7 +147,7 @@ const handleGet = async (request: Request, env: Env): Promise<Response> => {
 };
 
 const jsonResponse = (data: any, params: { status?: number; allowOrigin?: string; extraHeaders?: Record<string, string> }) => {
-	return new Response(JSON.stringify(data), {
+	return new Response(JSON.stringify(data, null, 2), { // Added pretty print
 		status: params.status || 200,
 		headers: { 
 			'content-type': 'application/json', 
